@@ -1,13 +1,19 @@
 from flask import Flask, render_template, request, jsonify, send_file
 import json
 import os
+import logging
+from werkzeug.exceptions import HTTPException
+from collections import defaultdict
 from dotenv import load_dotenv
 from groq import Groq
 from datetime import datetime
 from io import BytesIO
 import threading
 
-file_lock = threading.Lock()
+# Security enhancements: setup logging and fine-grained locks
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+file_locks = defaultdict(threading.Lock)
 
 # PDF
 from reportlab.lib.pagesizes import A4
@@ -17,6 +23,22 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # 2MB payload limit
+
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'SAMEORIGIN'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    return response
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    if isinstance(e, HTTPException):
+        return jsonify({"success": False, "error": e.description}), e.code
+    logger.error(f"Unhandled exception: {e}", exc_info=True)
+    return jsonify({"success": False, "error": "An internal server error occurred."}), 500
 
 # ================= ENV =================
 load_dotenv()
@@ -24,27 +46,60 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # ================= PATHS =================
-MED_DATA_PATH = os.path.join("data", "medicines.json")
-HISTORY_PATH = os.path.join("data", "history.json")
-FAV_PATH = os.path.join("data", "favorites.json")
-ANALYTICS_PATH = os.path.join("data", "analytics.json")
+def get_safe_path(base, filename):
+    safe_dir = os.path.abspath(base)
+    target_path = os.path.abspath(os.path.join(base, filename))
+    if not target_path.startswith(safe_dir):
+        raise ValueError("Path traversal attempt detected")
+    return target_path
+
+MED_DATA_PATH = get_safe_path("data", "medicines.json")
+HISTORY_PATH = get_safe_path("data", "history.json")
+FAV_PATH = get_safe_path("data", "favorites.json")
+ANALYTICS_PATH = get_safe_path("data", "analytics.json")
 
 
 # ================= HELPERS =================
 def load_json(path, default):
-    with file_lock:
+    with file_locks[path]:
         if not os.path.exists(path):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(default, f, indent=2)
             return default
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            logger.error(f"Corrupt JSON at {path}: {e}. Backing up and resetting.")
+            os.rename(path, path + ".bak")
+            return default
 
 def save_json(path, data):
-    with file_lock:
-        with open(path, "w", encoding="utf-8") as f:
+    with file_locks[path]:
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+        os.replace(tmp_path, path)
+
+def update_json_file(path, modifier_func, default):
+    with file_locks[path]:
+        if not os.path.exists(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            data = default
+        else:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except json.JSONDecodeError:
+                data = default
+        
+        data = modifier_func(data)
+        
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, path)
 
 
 MED_DB = load_json(MED_DATA_PATH, {})
@@ -58,25 +113,32 @@ def add_to_history(query: str, source: str):
     if not query:
         return
 
-    history = load_json(HISTORY_PATH, [])
-    history = [h for h in history if h.get("query", "").lower() != query.lower()]
-
-    history.insert(0, {
-        "query": query,
-        "source": source,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    })
-
-    save_json(HISTORY_PATH, history[:10])
+    def modifier(history):
+        history = [h for h in history if h.get("query", "").lower() != query.lower()]
+        history.insert(0, {
+            "query": query,
+            "source": source,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+        return history[:10]
+    
+    update_json_file(HISTORY_PATH, modifier, [])
 
 
 def update_analytics(query: str):
     query = query.strip().lower()
     if not query:
         return
-    analytics = load_json(ANALYTICS_PATH, {})
-    analytics[query] = analytics.get(query, 0) + 1
-    save_json(ANALYTICS_PATH, analytics)
+    
+    def modifier(analytics):
+        analytics[query] = analytics.get(query, 0) + 1
+        if len(analytics) > 10000:
+            sorted_items = sorted(analytics.items(), key=lambda x: x[1])
+            for k, _ in sorted_items[:1000]:
+                del analytics[k]
+        return analytics
+
+    update_json_file(ANALYTICS_PATH, modifier, {})
 
 
 def groq_medicine_lookup(medicine_name: str):
@@ -118,6 +180,7 @@ Return JSON only.
         ],
         temperature=0.2,
         max_tokens=700,
+        timeout=15.0,
     )
 
     text = completion.choices[0].message.content.strip()
@@ -175,29 +238,31 @@ def favorites_api():
 
 @app.route("/api/favorites/toggle", methods=["POST"])
 def favorites_toggle():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     medicine = (data.get("medicine") or "").strip().lower()
     generic_name = (data.get("generic_name") or "").strip()
 
     if not medicine:
-        return jsonify({"success": False, "error": "Medicine missing."})
+        return jsonify({"success": False, "error": "Medicine missing."}), 400
 
-    favs = load_json(FAV_PATH, [])
+    favorited_state = {"status": False}
 
-    existing = next((f for f in favs if f.get("medicine", "").lower() == medicine), None)
-    if existing:
-        favs = [f for f in favs if f.get("medicine", "").lower() != medicine]
-        save_json(FAV_PATH, favs)
-        return jsonify({"success": True, "favorited": False})
+    def modifier(favs):
+        existing = next((f for f in favs if f.get("medicine", "").lower() == medicine), None)
+        if existing:
+            favorited_state["status"] = False
+            return [f for f in favs if f.get("medicine", "").lower() != medicine]
 
-    favs.insert(0, {
-        "medicine": medicine,
-        "generic_name": generic_name,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    })
-    favs = favs[:20]
-    save_json(FAV_PATH, favs)
-    return jsonify({"success": True, "favorited": True})
+        favorited_state["status"] = True
+        favs.insert(0, {
+            "medicine": medicine,
+            "generic_name": generic_name,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+        return favs[:20]
+
+    update_json_file(FAV_PATH, modifier, [])
+    return jsonify({"success": True, "favorited": favorited_state["status"]})
 
 
 @app.route("/api/analytics", methods=["GET"])
@@ -210,11 +275,11 @@ def analytics_api():
 
 @app.route("/api/medicine", methods=["POST"])
 def medicine_info():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     medicine = (data.get("medicine") or "").strip().lower()[:200]
 
     if not medicine:
-        return jsonify({"success": False, "error": "Please enter a medicine name."})
+        return jsonify({"success": False, "error": "Please enter a medicine name."}), 400
 
     medicine = " ".join(medicine.split())
 
@@ -276,31 +341,6 @@ def get_medicine_data(medicine_name: str):
     if err:
         return None, None, err
     return ai_data, "groq", None
-def get_medicine_data(medicine_name: str):
-    """
-    Returns: (data_dict, source, error)
-    source => "database" or "groq"
-    """
-    medicine = (medicine_name or "").strip().lower()
-    if not medicine:
-        return None, None, "Medicine name missing."
-
-    medicine = " ".join(medicine.split())
-
-    # 1) exact
-    if medicine in MED_DB:
-        return MED_DB[medicine], "database", None
-
-    # 2) partial
-    for key in MED_DB:
-        if medicine in key or key in medicine:
-            return MED_DB[key], "database", None
-
-    # 3) groq
-    ai_data, err = groq_medicine_lookup(medicine)
-    if err:
-        return None, None, err
-    return ai_data, "groq", None
 
 @app.route("/compare")
 def compare_page():
@@ -308,13 +348,13 @@ def compare_page():
 
 @app.route("/api/compare", methods=["POST"])
 def compare_medicines():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
 
-    med_a = (data.get("medicineA") or "").strip()
-    med_b = (data.get("medicineB") or "").strip()
+    med_a = (data.get("medicineA") or "").strip()[:200]
+    med_b = (data.get("medicineB") or "").strip()[:200]
 
     if not med_a or not med_b:
-        return jsonify({"success": False, "error": "Please enter both medicine names."})
+        return jsonify({"success": False, "error": "Please enter both medicine names."}), 400
 
     a_data, a_source, err_a = get_medicine_data(med_a)
     if err_a:
@@ -365,6 +405,7 @@ Return JSON only.
                 ],
                 temperature=0.2,
                 max_tokens=600,
+                timeout=15.0,
             )
             verdict_text = completion.choices[0].message.content.strip()
             verdict = json.loads(verdict_text)
@@ -387,13 +428,13 @@ def interaction_page():
     return render_template("interaction.html")
 @app.route("/api/interaction", methods=["POST"])
 def medicine_interaction():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
 
-    med_a = (data.get("medicineA") or "").strip()
-    med_b = (data.get("medicineB") or "").strip()
+    med_a = (data.get("medicineA") or "").strip()[:200]
+    med_b = (data.get("medicineB") or "").strip()[:200]
 
     if not med_a or not med_b:
-        return jsonify({"success": False, "error": "Please enter both medicine names."})
+        return jsonify({"success": False, "error": "Please enter both medicine names."}), 400
 
     if client is None:
         return jsonify({"success": False, "error": "Groq API key missing. Add GROQ_API_KEY in .env"})
@@ -455,7 +496,7 @@ Return JSON only.
         })
 @app.route("/api/favorites/clear", methods=["POST"])
 def clear_favorites():
-    save_json(FAV_PATH, [])
+    update_json_file(FAV_PATH, lambda _: [], [])
     return jsonify({"success": True, "message": "Favorites cleared successfully."})
 
 
@@ -464,9 +505,9 @@ def report_pdf():
     """
     Creates a PDF report for current medicine response.
     """
-    data = request.get_json()
-    medicine = (data.get("medicine") or "Unknown").upper()
-    source = (data.get("source") or "Unknown")
+    data = request.get_json(silent=True) or {}
+    medicine = (data.get("medicine") or "Unknown").upper()[:200]
+    source = (data.get("source") or "Unknown")[:100]
     med = data.get("data") or {}
 
     generic = med.get("generic_name", "")
@@ -540,23 +581,23 @@ def report_pdf():
 
 @app.route("/api/history/clear", methods=["POST"])
 def clear_history():
-    # Clear history
-    save_json(HISTORY_PATH, [])
+    update_json_file(HISTORY_PATH, lambda _: [], [])
     return jsonify({"success": True, "message": "History cleared successfully."})
+
 @app.route("/api/analytics/clear", methods=["POST"])
 def clear_analytics():
-    save_json(ANALYTICS_PATH, {})
+    update_json_file(ANALYTICS_PATH, lambda _: {}, {})
     return jsonify({"success": True, "message": "Analytics cleared successfully."})
 @app.route("/assistant")
 def assistant_page():
     return render_template("assistant.html")
 @app.route("/api/assistant", methods=["POST"])
 def assistant_api():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     query = (data.get("query") or "").strip()[:500]
 
     if not query:
-        return jsonify({"success": False, "error": "Empty query."})
+        return jsonify({"success": False, "error": "Empty query."}), 400
 
     if client is None:
         return jsonify({"success": False, "error": "Groq API key missing. Add GROQ_API_KEY in .env"})
@@ -581,7 +622,8 @@ Rules:
                 {"role": "user", "content": query},
             ],
             temperature=0.3,
-            max_tokens=700
+            max_tokens=700,
+            timeout=15.0
         )
 
         answer = completion.choices[0].message.content.strip()
@@ -592,10 +634,10 @@ Rules:
 
 @app.route("/download-report", methods=["POST"])
 def download_report():
-    data = request.get_json() or {}
-    symptoms = data.get("symptoms", "")
-    extracted_text = data.get("extracted_text", "")
-    ai_insights = data.get("ai_insights", "")
+    data = request.get_json(silent=True) or {}
+    symptoms = str(data.get("symptoms", ""))[:5000]
+    extracted_text = str(data.get("extracted_text", ""))[:5000]
+    ai_insights = str(data.get("ai_insights", ""))[:5000]
 
     buffer = BytesIO()
     doc = SimpleDocTemplate(
@@ -680,4 +722,5 @@ def download_report():
     )
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    is_debug = os.getenv("FLASK_DEBUG", "False").lower() == "true"
+    app.run(debug=is_debug, host="0.0.0.0", port=5000)
