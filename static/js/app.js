@@ -402,6 +402,9 @@ if (clearHistoryBtn) {
 
       if (data.success) {
         setStatus("✅ History cleared!");
+         setTimeout(() => {
+         setStatus(""); // ← dismiss the message after 2.5s
+         }, 2000);
         loadHistory();
         loadSuggestions();
       } else {
