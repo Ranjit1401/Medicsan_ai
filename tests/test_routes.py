@@ -63,14 +63,13 @@ def test_api_suggestions(client, mocker):
     assert any(s.lower().startswith("para") for s in data["suggestions"])
 
 
-def test_api_medicine_unauthenticated(client):
-    # /api/medicine now requires login; unauthenticated requests must be redirected.
+def test_api_medicine_unauthenticated_redirects(client):
+    """POST /api/medicine without a session must redirect to login."""
     response = client.post("/api/medicine", json={"medicine": "paracetamol"})
     assert response.status_code in (302, 401)
 
 
 def test_api_medicine_no_data(logged_in_client):
-    # Authenticated request with an empty body must still return 400.
     response = logged_in_client.post("/api/medicine", json={})
     assert response.status_code == 400
     assert response.get_json()["success"] is False

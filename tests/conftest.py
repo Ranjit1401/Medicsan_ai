@@ -51,7 +51,7 @@ def init_database(app):
 
 @pytest.fixture
 def logged_in_client(client, init_database):
-    """Return a test client that is already logged in as a test user."""
+    """Return a test client that is already authenticated as a test user."""
     client.post("/register", data={"username": "testuser", "password": "testpass123"})
     client.post("/login", data={"username": "testuser", "password": "testpass123"})
     return client
