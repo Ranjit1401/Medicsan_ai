@@ -113,9 +113,7 @@ h1 {
   font-weight: 900;
   text-align: center;
   letter-spacing: 0.5px;
-  background: linear-gradient(135deg, #ffffff 0%, #ffffff 45%, #ffffff 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
+  color: var(--text);
 }
 
 .emoji {
